@@ -1,0 +1,167 @@
+/*
+  HILL AREA MONITORING - RX NODE
+  ESP32 30-pin DevKit + Ai-Thinker RA-02 (SX1278) + WiFi Access Point + Web Server
+
+  Receives the TX node's sensor packet over LoRa and shows it on a web
+  dashboard, with color-coded alerts. No internet/router needed.
+
+  Wiring (same as TX, no sensors on this board):
+    RA-02 3.3V -> 3V3      RA-02 GND  -> GND
+    RA-02 NSS  -> GPIO5    RA-02 SCK  -> GPIO18
+    RA-02 MISO -> GPIO19   RA-02 MOSI -> GPIO23
+    RA-02 RST  -> GPIO14   RA-02 DIO0 -> GPIO4
+
+  How to use:
+    1. Upload this sketch to the RX ESP32.
+    2. On your phone/laptop, connect to WiFi "LoRa_Receiver" (password below).
+    3. Open a browser to  http://192.168.4.1
+    4. The page auto-refreshes every 2 seconds.
+
+  Expected packet format from TX node:
+    S:<smoke>,T:<temp>,H:<hum>,V:<vib>,F:<0/1>,E:<0/1>,R:<0/1>
+*/
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+#define LORA_SS    5
+#define LORA_RST   14
+#define LORA_DIO0  4
+#define LORA_FREQ  433E6
+
+const char* AP_SSID = "LoRa_Receiver";
+const char* AP_PASS = "12345678";
+
+WebServer server(80);
+
+// ---------- Latest parsed sensor data ----------
+int   lastSmoke   = 0;
+float lastTemp    = -999;
+float lastHum     = -999;
+float lastVib     = 0;
+int   fireAlert   = 0;
+int   envAlert    = 0;
+int   rockAlert   = 0;
+
+int     lastRssi     = 0;
+float   lastSnr      = 0;
+unsigned long lastMs  = 0;
+unsigned long packetCount = 0;
+
+// Extract the value for "key:" out of a "key:val,key:val,..." string
+String getField(String data, String key) {
+  int idx = data.indexOf(key + ":");
+  if (idx == -1) return "";
+  int start = idx + key.length() + 1;
+  int end = data.indexOf(',', start);
+  if (end == -1) end = data.length();
+  return data.substring(start, end);
+}
+
+void parsePacket(String msg) {
+  lastSmoke = getField(msg, "S").toInt();
+  lastTemp  = getField(msg, "T").toFloat();
+  lastHum   = getField(msg, "H").toFloat();
+  lastVib   = getField(msg, "V").toFloat();
+  fireAlert = getField(msg, "F").toInt();
+  envAlert  = getField(msg, "E").toInt();
+  rockAlert = getField(msg, "R").toInt();
+}
+
+String alertBadge(int active, String label) {
+  if (active) {
+    return "<span style='background:#e33;color:#fff;padding:4px 10px;border-radius:6px;margin:3px;display:inline-block;'>" + label + "</span>";
+  }
+  return "<span style='background:#3a3;color:#fff;padding:4px 10px;border-radius:6px;margin:3px;display:inline-block;'>OK</span>";
+}
+
+void handleRoot() {
+  unsigned long secsAgo = lastMs == 0 ? 0 : (millis() - lastMs) / 1000;
+
+  String tempStr = (lastTemp <= -998) ? "sensor error" : String(lastTemp, 1) + " &deg;C";
+  String humStr  = (lastHum  <= -998) ? "sensor error" : String(lastHum, 1) + " %";
+
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta http-equiv='refresh' content='2'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Hill Monitor</title>";
+  html += "<style>body{font-family:sans-serif;text-align:center;margin-top:30px;background:#f7f7f7;}";
+  html += "h1{font-size:22px;} table{margin:20px auto;font-size:16px;background:#fff;border-collapse:collapse;}";
+  html += "td{padding:8px 16px;text-align:left;border-bottom:1px solid #eee;}";
+  html += ".meta{font-size:13px;color:#777;margin-top:20px;}</style>";
+  html += "</head><body>";
+  html += "<h1>Hill Area Monitoring</h1>";
+
+  html += "<table>";
+  html += "<tr><td>Smoke/Gas (MQ-2)</td><td>" + String(lastSmoke) + "</td><td>" + alertBadge(fireAlert, "FIRE/SMOKE") + "</td></tr>";
+  html += "<tr><td>Temperature</td><td>" + tempStr + "</td><td rowspan='2'>" + alertBadge(envAlert, "ENV WARNING") + "</td></tr>";
+  html += "<tr><td>Humidity</td><td>" + humStr + "</td></tr>";
+  html += "<tr><td>Vibration</td><td>" + String(lastVib, 2) + " m/s&sup2;</td><td>" + alertBadge(rockAlert, "ROCK MOVEMENT") + "</td></tr>";
+  html += "</table>";
+
+  html += "<div class='meta'>";
+  html += "RSSI: " + String(lastRssi) + " dBm &nbsp;|&nbsp; SNR: " + String(lastSnr, 2) + " dB<br>";
+  html += "Packets received: " + String(packetCount) + " &nbsp;|&nbsp; Last update: " + String(secsAgo) + "s ago";
+  html += "</div>";
+
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("Hill Monitor RX + WiFi AP");
+
+  // --- LoRa init ---
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("LoRa init failed. Check wiring.");
+    while (true);
+  }
+  LoRa.setSpreadingFactor(9);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.setPreambleLength(8);
+  LoRa.setSyncWord(0x12);
+  LoRa.enableCrc();
+  Serial.println("LoRa ready.");
+
+  // --- WiFi Access Point ---
+  WiFi.softAP(AP_SSID, AP_PASS);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("AP started. SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("Browse to: http://");
+  Serial.println(ip);
+
+  // --- Web server ---
+  server.on("/", handleRoot);
+  server.begin();
+  Serial.println("Web server started.");
+}
+
+void loop() {
+  server.handleClient();
+
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String msg = "";
+    while (LoRa.available()) {
+      msg += (char)LoRa.read();
+    }
+
+    parsePacket(msg);
+    lastRssi = LoRa.packetRssi();
+    lastSnr  = LoRa.packetSnr();
+    lastMs   = millis();
+    packetCount++;
+
+    Serial.print("Received: ");
+    Serial.println(msg);
+  }
+}
